@@ -1,0 +1,132 @@
+import requests
+import pandas as pd
+import time
+import math
+import os
+
+PRICE_URL = "https://prices.runescape.wiki/api/v1/osrs/latest"
+MAPPING_URL = "https://prices.runescape.wiki/api/v1/osrs/mapping"
+HEADERS = {"User-Agent": "OSRS-Quant-Engine"}
+
+# CONFIG
+REFRESH_SECONDS = 5
+MAX_CAPITAL = 200_000
+MIN_SPREAD_GP = 1
+MIN_LIMIT = 1000
+
+def clear():
+    os.system("cls" if os.name == "nt" else "clear")
+
+def fetch(url):
+    return requests.get(url, headers=HEADERS, timeout=20).json()
+
+# --- STATIC DATA (load once, never reload) ---
+mapping = pd.DataFrame(fetch(MAPPING_URL))
+mapping = mapping[mapping["members"] == False]
+
+# --- STATE MEMORY (THIS IS IMPORTANT) ---
+previous_prices = {}
+
+print("🧠 OSRS ECONOMY ANALYSIS ENGINE")
+print("⚡ High-frequency market microstructure model\n")
+time.sleep(2)
+
+while True:
+    try:
+        clear()
+        print("📈 LIVE OSRS MARKET STATE (5s refresh)")
+        print("💰 Max exposure per trade: 200k GP\n")
+
+        prices = fetch(PRICE_URL)["data"]
+        rows = []
+
+        for item_id, d in prices.items():
+            if d.get("high") and d.get("low"):
+                rows.append({
+                    "id": int(item_id),
+                    "buy": d["high"],
+                    "sell": d["low"]
+                })
+
+        df = pd.DataFrame(rows)
+        df = mapping.merge(df, on="id")
+
+        # Core economics
+        df["spread"] = df["buy"] - df["sell"]
+        df["spread_pct"] = df["spread"] / df["sell"] * 100
+
+        # Exposure constraint
+        df["max_units"] = (MAX_CAPITAL // df["sell"]).clip(lower=1)
+
+        # Motion detection (THIS is key)
+        motions = []
+        for _, row in df.iterrows():
+            pid = row["id"]
+            mid_price = (row["buy"] + row["sell"]) / 2
+
+            if pid in previous_prices:
+                delta = mid_price - previous_prices[pid]
+            else:
+                delta = 0
+
+            motions.append(delta)
+            previous_prices[pid] = mid_price
+
+        df["price_motion"] = motions
+        df["abs_motion"] = df["price_motion"].abs()
+
+        # Liquidity / flow proxy
+        df["units_per_hour_est"] = (df["limit"] / 4) * (1 / (df["spread_pct"].abs() + 1))
+
+        # Fill-time estimates (quant logic)
+        df["buy_fill_minutes"] = (
+            df["max_units"] / (df["units_per_hour_est"] + 1)
+        ) * 60
+
+        df["sell_fill_minutes"] = df["buy_fill_minutes"]
+
+        # Filters (VERY permissive)
+        df = df[
+            (df["spread"] >= MIN_SPREAD_GP) &
+            (df["limit"] >= MIN_LIMIT) &
+            (df["sell"] <= MAX_CAPITAL)
+        ]
+
+        if df.empty:
+            print("Market quiet. Waiting next tick…")
+            time.sleep(REFRESH_SECONDS)
+            continue
+
+        # Expected profit per cycle
+        df["cycle_profit"] = df["spread"] * df["max_units"]
+
+        # Signal strength = motion * liquidity * profit
+        df["signal_score"] = (
+            df["abs_motion"] *
+            df["units_per_hour_est"] *
+            df["spread"]
+        )
+
+        df = df.sort_values("signal_score", ascending=False)
+
+        print("🔥 TOP ACTIVE INSTRUMENTS 🔥\n")
+        print(df[
+            [
+                "name",
+                "sell",
+                "buy",
+                "spread",
+                "max_units",
+                "cycle_profit",
+                "buy_fill_minutes",
+                "sell_fill_minutes"
+            ]
+        ].head(10).to_string(index=False))
+
+        print(f"\n⏱ Updating again in {REFRESH_SECONDS}s …")
+        time.sleep(REFRESH_SECONDS)
+
+    except Exception as e:
+        print("Error:", e)
+        time.sleep(10)
+        
