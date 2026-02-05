@@ -1,0 +1,140 @@
+name: OSRS Market Engine (5s Live Loop)
+
+on:
+  workflow_dispatch:   # manual start only
+
+jobs:
+  market-engine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # max allowed (~6 hours)
+
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install requests pandas
+
+      - name: Run OSRS Quant Market Engine (LIVE)
+        run: |
+          python - << 'EOF'
+          import requests
+          import pandas as pd
+          import time
+          import os
+
+          PRICE_URL = "https://prices.runescape.wiki/api/v1/osrs/latest"
+          MAPPING_URL = "https://prices.runescape.wiki/api/v1/osrs/mapping"
+          HEADERS = {"User-Agent": "OSRS-Quant-Engine-GHA"}
+
+          REFRESH_SECONDS = 5
+          MAX_CAPITAL = 200_000
+          MIN_SPREAD_GP = 1
+          MIN_LIMIT = 1000
+
+          def fetch(url):
+              return requests.get(url, headers=HEADERS, timeout=20).json()
+
+          print("🧠 OSRS ECONOMY ANALYSIS ENGINE (GitHub Actions)")
+          print("⚡ 5s live loop | volume & motion driven\n")
+
+          # Load static mapping once
+          mapping = pd.DataFrame(fetch(MAPPING_URL))
+          mapping = mapping[mapping["members"] == False]
+
+          previous_prices = {}
+
+          start_time = time.time()
+
+          while True:
+              # Safety exit (runner hard stop protection)
+              if time.time() - start_time > 21000:  # ~5.8 hours
+                  print("⏹ Runner time limit reached. Exiting cleanly.")
+                  break
+
+              os.system("clear")
+
+              print("📈 LIVE OSRS MARKET STATE (5s refresh)")
+              print("💰 Max capital per trade: 200k GP\n")
+
+              prices = fetch(PRICE_URL)["data"]
+              rows = []
+
+              for item_id, d in prices.items():
+                  if d.get("high") and d.get("low"):
+                      rows.append({
+                          "id": int(item_id),
+                          "buy": d["high"],
+                          "sell": d["low"]
+                      })
+
+              df = pd.DataFrame(rows)
+              df = mapping.merge(df, on="id")
+
+              df["spread"] = df["buy"] - df["sell"]
+              df["spread_pct"] = df["spread"] / df["sell"] * 100
+              df["max_units"] = (MAX_CAPITAL // df["sell"]).clip(lower=1)
+
+              motions = []
+              for _, r in df.iterrows():
+                  pid = r["id"]
+                  mid = (r["buy"] + r["sell"]) / 2
+                  delta = mid - previous_prices.get(pid, mid)
+                  previous_prices[pid] = mid
+                  motions.append(delta)
+
+              df["price_motion"] = motions
+              df["abs_motion"] = df["price_motion"].abs()
+
+              df["units_per_hour_est"] = (
+                  (df["limit"] / 4) *
+                  (1 / (df["spread_pct"].abs() + 1))
+              )
+
+              df["buy_fill_minutes"] = (
+                  df["max_units"] / (df["units_per_hour_est"] + 1)
+              ) * 60
+
+              df["sell_fill_minutes"] = df["buy_fill_minutes"]
+
+              df = df[
+                  (df["spread"] >= MIN_SPREAD_GP) &
+                  (df["limit"] >= MIN_LIMIT) &
+                  (df["sell"] <= MAX_CAPITAL)
+              ]
+
+              if df.empty:
+                  print("Market quiet. Waiting…")
+                  time.sleep(REFRESH_SECONDS)
+                  continue
+
+              df["cycle_profit"] = df["spread"] * df["max_units"]
+              df["signal_score"] = (
+                  df["abs_motion"] *
+                  df["units_per_hour_est"] *
+                  df["spread"]
+              )
+
+              df = df.sort_values("signal_score", ascending=False)
+
+              print("🔥 TOP ACTIVE INSTRUMENTS 🔥\n")
+              print(df[
+                  [
+                      "name",
+                      "sell",
+                      "buy",
+                      "spread",
+                      "max_units",
+                      "cycle_profit",
+                      "buy_fill_minutes",
+                      "sell_fill_minutes"
+                  ]
+              ].head(10).to_string(index=False))
+
+              print(f"\n⏱ Next update in {REFRESH_SECONDS}s")
+              time.sleep(REFRESH_SECONDS)
+          EOF
+          
